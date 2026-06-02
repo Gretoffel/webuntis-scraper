@@ -72,10 +72,6 @@ class ScraperConfig:
         SESSIONS_DIR / "storage_state.json"
     )
 
-    # Auth: prefer JSON-RPC (fast, no DOM). Set to True to force the
-    # form-based login path (useful for 2FA / SSO / custom schools).
-    force_form_login: bool = False
-
     def derived_urls(self) -> None:
         if self.server and self.school:
             self.base_url = f"https://{self.server}.webuntis.com"
@@ -143,7 +139,7 @@ def load_config(
         if field_name in {
             "headless", "pretty_json", "include_raw",
             "scrape_timetable", "scrape_exams", "scrape_homework",
-            "scrape_absences", "scrape_messages", "force_form_login",
+            "scrape_absences", "scrape_messages",
         }:
             current = getattr(cfg, field_name, False)
             setattr(cfg, field_name, _coerce_bool(v, current))

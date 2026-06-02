@@ -60,10 +60,6 @@ def _parse_args() -> argparse.Namespace:
         "--days-forward", type=int, default=None,
         help="Override config: how many days in the future to scrape.",
     )
-    ap.add_argument(
-        "--form-login", action="store_true",
-        help="Force form-based login (for 2FA / SSO). Default: JSON-RPC.",
-    )
     ap.add_argument("-v", "--verbose", action="store_true", help="Debug logging.")
     return ap.parse_args()
 
@@ -78,8 +74,6 @@ async def _async_main(args: argparse.Namespace) -> int:
         cfg.days_back = args.days_back
     if args.days_forward is not None:
         cfg.days_forward = args.days_forward
-    if args.form_login:
-        cfg.force_form_login = True
 
     async with BrowserSession(cfg) as session:
         if args.clear_session:

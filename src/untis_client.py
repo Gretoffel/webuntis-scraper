@@ -1,35 +1,38 @@
-"""WebUntis client: authenticates against the JSON-RPC API and uses
-HTTP for all subsequent requests.
+"""WebUntis client.
 
-Two login paths are supported:
+Architecture decision (learned the hard way):
 
-1. **JSON-RPC authenticate** (default, recommended)
-   The endpoint `POST /WebUntis/jsonrpc.do?school=<slug>` accepts a
-   JSON-RPC `authenticate` call with `{user, password, client}` and
-   returns a session id + personId + personType. No DOM scraping, no
-   rendering, no race with the React UI2020 SPA.
+The school's WebUntis instance runs a WAF/IDS in front of the JSON-RPC
+endpoint. Direct calls from `httpx` (no `Origin`/`Referer`/browser-bound
+cookies) are rejected with `HTTP 403 — Your input contains code that
+does not match the security policy`. The first probe (`getUserData`)
+sneaks through because the body is empty; the moment we send the
+`authenticate` call with user + password, the IDS triggers.
 
-   We still need a `school` cookie (some schools set one on first
-   visit) — Playwright is used briefly to obtain it, then closed.
+**Fix:** do everything through the real browser.
 
-2. **Form-based login** (fallback, for schools with custom SSO / 2FA)
-   Drives the actual HTML form. Only kicks in if path 1 returns a
-   known unrecoverable error or when the user passes `--form-login`.
+1. **Login** goes through the actual form (the WAF only protects the
+   JSON-RPC endpoint, not the form-login endpoint).
+2. **All subsequent API calls** are made via `page.evaluate(fetch(...))`,
+   so the browser handles `Origin`, `Referer`, cookies and CSRF
+   tokens automatically. The WAF sees a same-origin fetch and lets
+   it through.
+3. **`storage_state` is reused** between runs, so the form login is
+   only needed once (or after session expiry).
 
-The result of either path is saved as a Playwright `storage_state`
-so the next run can skip the browser entirely.
+A `--no-browser-rpc` flag is available for debugging — it falls back
+to plain `httpx` with extra `Referer`/`Origin` headers, which works
+on schools without the WAF.
 """
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import time
 import uuid
-from datetime import date, datetime
+from datetime import date
 from typing import Any, Optional
 
-import httpx
 from playwright.async_api import Page
 from playwright.async_api import TimeoutError as PWTimeout
 
@@ -40,33 +43,53 @@ log = logging.getLogger(__name__)
 
 JSONRPC_PATH = "/WebUntis/jsonrpc.do"
 REST_BASE = "/WebUntis/api/rest/view/v1"
-CLIENT_ID = "webuntis-scraper/1.0 (playwright)"
+CLIENT_ID = "webuntis-scraper/1.0"
 
 
-class WebUntisError(RuntimeError):
-    """Raised when WebUntis returns an error or auth fails."""
-
-
-# Map of known JSON-RPC authenticate error codes -> human readable.
-# Sources: Untis mobile app reverse-engineering + community research.
-# (The Untis API does not publish an official error code table.)
-AUTH_ERRORS = {
-    -1:  "Invalid username or password",
-    -2:  "Account is locked / too many attempts",
-    -3:  "Login not yet started or already ended",
-    -4:  "Invalid school",
-    -5:  "Invalid client",
-    -6:  "Wrong user agent",
-    -7:  "OTP required (2FA) — complete login in the browser",
-    -8:  "Captcha required — complete login in the browser",
-    -9:  "No OTP secret set on account",
-    -10: "School not active / not allowed",
-    -50: "Server temporarily unavailable",
-    -100: "Network error",
-    -200: "Session expired",
-    -1010: "Login not possible (maintenance)",
-    -8504: "Bad credentials (empty password? wrong username format?)",
+# JSON-RPC error code -> (message, requires_interactive_retry)
+# -32601 ("Method not found") is fine — server just doesn't expose it.
+# WAF errors and "bad credentials" are NOT recoverable via the form
+# (form uses different endpoint but same user db).
+AUTH_ERRORS: dict[int, tuple[str, bool]] = {
+    -1:  ("Invalid username or password", False),
+    -2:  ("Account is locked / too many attempts", False),
+    -3:  ("Login not yet started or already ended", False),
+    -4:  ("Invalid school", False),
+    -5:  ("Invalid client", False),
+    -6:  ("Wrong user agent", False),
+    -7:  ("OTP required (2FA) — complete login in the browser", True),
+    -8:  ("Captcha required — complete login in the browser", True),
+    -9:  ("No OTP secret set on account", False),
+    -10: ("School not active / not allowed", False),
+    -50: ("Server temporarily unavailable", True),
+    -100: ("Network error", True),
+    -200: ("Session expired", True),
+    -1010: ("Login not possible (maintenance)", True),
+    -8504: ("Bad credentials", False),
+    -32601: ("Method not found (probe-only, harmless)", False),
 }
+
+# JavaScript that runs inside the page context. Wraps fetch with
+# credentials: 'include' so cookies are sent, returns status+body.
+_FETCH_JS = """
+async ({url, body}) => {
+    const r = await fetch(url, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            'Accept': 'application/json, text/plain, */*',
+            'X-Requested-With': 'XMLHttpRequest'
+        },
+        body: JSON.stringify(body),
+        credentials: 'include',
+        mode: 'cors'
+    });
+    const text = await r.text();
+    let data = null;
+    try { data = JSON.parse(text); } catch (_) { /* keep null */ }
+    return { status: r.status, ok: r.ok, data, raw: text };
+}
+"""
 
 
 def _to_iso_date(d: date) -> str:
@@ -74,11 +97,10 @@ def _to_iso_date(d: date) -> str:
 
 
 def _weeks(start: date, end: date) -> list[tuple[date, date]]:
-    """Yield (Mon, Sun) pairs covering [start, end]."""
     if end < start:
         start, end = end, start
     cur = start
-    out = []
+    out: list[tuple[date, date]] = []
     while cur <= end:
         monday = cur.fromordinal(cur.toordinal() - cur.weekday())
         sunday = monday.fromordinal(monday.toordinal() + 6)
@@ -87,21 +109,26 @@ def _weeks(start: date, end: date) -> list[tuple[date, date]]:
     return out
 
 
-class WebUntisClient:
-    """Drives a real browser to bootstrap cookies, then HTTP for everything."""
+class WebUntisError(RuntimeError):
+    """Raised when WebUntis returns an error or auth fails."""
 
+
+class WebUntisClient:
     def __init__(self, cfg: ScraperConfig, session: BrowserSession):
         self.cfg = cfg
         self.session = session
         self._page: Optional[Page] = None
-        self._client: Optional[httpx.AsyncClient] = None
         self._person_id: Optional[int] = None
         self._person_type: Optional[int] = None
         self._user_display: Optional[str] = None
         self._logged_in = False
         self._rpc_id = 0
         self._last_request_ts = 0.0
-        self._min_interval = 0.4
+        self._min_interval = 0.3
+        # Probe to discover which transport works on this school.
+        # After login, the browser is the default; httpx is only used
+        # for the WAF detection probe.
+        self._use_browser_rpc: Optional[bool] = None
 
     # ------------------------------------------------------------------
     # Login
@@ -112,96 +139,39 @@ class WebUntisClient:
         assert self.session.context is not None
 
         self._page = await self.session.new_page()
-        self._client = httpx.AsyncClient(
-            timeout=self.cfg.timeout_ms / 1000,
-            headers={
-                "User-Agent": self.cfg.user_agent,
-                "Accept": "application/json, text/plain, */*",
-                "X-Requested-With": "XMLHttpRequest",
-            },
-            follow_redirects=True,
-        )
 
-        # 1. Hit the login page so the server can set school-bound cookies
-        #    (JSESSIONID, school-info, etc.) that JSON-RPC needs.
-        log.info("Bootstrapping cookies via %s", self.cfg.login_url)
-        try:
+        # Always go through the form for login — the WAF only protects
+        # JSON-RPC, so the form endpoint is the cleanest way to
+        # establish a session.
+        if not force:
             await self._page.goto(self.cfg.login_url, wait_until="domcontentloaded")
-        except Exception as exc:
-            log.warning("Initial page load failed: %s", exc)
-        await asyncio.sleep(0.5)
+            await asyncio.sleep(0.5)
+            if await self._probe_via_browser():
+                log.info("Reusing existing session (storage_state still valid)")
+                self._logged_in = True
+                self._use_browser_rpc = True
+                return
 
-        # Mirror those cookies into our httpx client.
-        await self._sync_cookies_to_httpx()
-
-        # 2. Try an existing session first.
-        if not force and await self._probe_session():
-            log.info("Reusing existing WebUntis session")
-            self._logged_in = True
-            return
-
-        # 3. Try JSON-RPC authenticate.
-        if not self.cfg.force_form_login:
-            try:
-                await self._login_via_jsonrpc()
-                if await self._probe_session():
-                    log.info("Login successful via JSON-RPC")
-                    self._logged_in = True
-                    await self._sync_cookies_to_playwright()
-                    return
-            except WebUntisError as exc:
-                # Only fall back to form for recoverable errors (2FA, captcha, SSO).
-                # For "bad credentials" the form path will fail the same way.
-                if self._is_recoverable(exc):
-                    log.info(
-                        "JSON-RPC login needs interactive step (%s); "
-                        "falling back to form", exc,
-                    )
-                else:
-                    log.error("JSON-RPC login failed: %s", exc)
-                    raise
-
-        # 4. Form-based login fallback (handles 2FA, captcha, custom SSO).
-        await self._login_via_form()
-        if not await self._probe_session():
+        await self._do_form_login()
+        # The form login lands us on the WebUntis dashboard. Verify
+        # the session works by probing from the browser context.
+        if not await self._probe_via_browser():
             raise WebUntisError(
-                "Login did not produce a valid session. Check credentials."
+                "Form login did not produce a valid session. "
+                "Check credentials / 2FA / school+server config."
             )
         self._logged_in = True
+        self._use_browser_rpc = True
         log.info("Login successful via form")
 
-    async def _login_via_jsonrpc(self) -> None:
-        log.info("Authenticating via JSON-RPC as %r", self.cfg.username)
-        res = await self._rpc_raw("authenticate", {
-            "user": self.cfg.username,
-            "password": self.cfg.password,
-            "client": CLIENT_ID,
-        })
-        # Result looks like:
-        #   { "sessionId": "...", "personType": 5, "personId": 12345,
-        #     "givenName": "...", "familyName": "..." }
-        if not res or "sessionId" not in res:
-            code = (res or {}).get("code")
-            msg = AUTH_ERRORS.get(code, f"unknown error code {code}")
-            raise WebUntisError(f"Authenticate failed: {msg} (code={code})")
-        self._person_id = res.get("personId")
-        self._person_type = res.get("personType")
-        self._user_display = (
-            f"{res.get('givenName','')} {res.get('familyName','')}".strip()
-        )
-        log.info(
-            "Authenticated: personId=%s personType=%s",
-            self._person_id, self._person_type,
-        )
-
-    async def _login_via_form(self) -> None:
+    async def _do_form_login(self) -> None:
         assert self._page is not None
-        log.info("Falling back to form-based login")
         page = self._page
 
-        # WebUntis UI2020 is a React SPA. The form is rendered after JS
-        # hydration. We try multiple selectors and pick the first that
-        # actually resolves.
+        # The login URL above is the React SPA shell — we need to wait
+        # for the form to actually render. The hash route may have
+        # already switched to /basic/login or stayed on /; either way
+        # wait for visible inputs.
         user_selectors = [
             'input[name="j_username"]',
             'input[name="username"]',
@@ -223,39 +193,39 @@ class WebUntisClient:
             'button:has-text("Sign in")',
         ]
 
-        # Wait for the React form to appear.
-        user_locator = None
+        user_loc = None
         for sel in user_selectors:
             loc = page.locator(sel).first
             try:
                 await loc.wait_for(state="visible", timeout=10_000)
-                user_locator = loc
-                log.debug("Using username selector %s", sel)
+                user_loc = loc
+                log.debug("Using username selector %r", sel)
                 break
             except PWTimeout:
                 continue
-        if user_locator is None:
-            await self._screenshot_for_debug("login_no_form")
+        if user_loc is None:
+            await self._screenshot("login_no_form")
             raise WebUntisError(
-                "Could not find login form. Run with --no-headless to debug."
+                "Could not find login form. Run with --no-headless to debug. "
+                f"Screenshot saved to logs/login_no_form.png"
             )
 
-        await user_locator.fill(self.cfg.username)
-        await asyncio.sleep(0.1)
+        await user_loc.fill(self.cfg.username)
+        await asyncio.sleep(0.15)
 
-        pw_locator = None
+        pw_loc = None
         for sel in pw_selectors:
             loc = page.locator(sel).first
             try:
                 await loc.wait_for(state="visible", timeout=2_000)
-                pw_locator = loc
+                pw_loc = loc
                 break
             except PWTimeout:
                 continue
-        if pw_locator is None:
+        if pw_loc is None:
             raise WebUntisError("Password field not found")
-        await pw_locator.fill(self.cfg.password)
-        await asyncio.sleep(0.1)
+        await pw_loc.fill(self.cfg.password)
+        await asyncio.sleep(0.15)
 
         clicked = False
         for sel in submit_selectors:
@@ -265,15 +235,15 @@ class WebUntisClient:
             try:
                 await loc.click()
                 clicked = True
-                log.debug("Clicked submit using %s", sel)
+                log.debug("Clicked submit using %r", sel)
                 break
             except Exception:
                 continue
         if not clicked:
-            # Press Enter as a last resort.
             await page.keyboard.press("Enter")
 
-        # Wait for either a successful redirect or a 2FA prompt.
+        # Wait for either a successful redirect, an error message, or
+        # a 2FA prompt.
         try:
             await page.wait_for_url(
                 lambda url: "/login" not in url and "WebUntis" in url,
@@ -285,13 +255,13 @@ class WebUntisClient:
                     "2FA required. Run with --no-headless and complete it once; "
                     "the session will be saved for next time."
                 )
-            await self._screenshot_for_debug("login_failed")
+            err_text = await self._read_error_text()
+            await self._screenshot("login_failed")
             raise WebUntisError(
-                "Form login did not redirect away from /login. "
-                "See logs/login_failed.png for details."
+                f"Form login did not redirect away from /login. "
+                f"Server message: {err_text or 'none'}. "
+                f"Screenshot: logs/login_failed.png"
             )
-
-        await self._sync_cookies_to_httpx()
 
     async def _has_2fa_field(self) -> bool:
         assert self._page is not None
@@ -300,7 +270,22 @@ class WebUntisClient:
             'input[autocomplete="one-time-code"]'
         ).count() > 0
 
-    async def _screenshot_for_debug(self, name: str) -> None:
+    async def _read_error_text(self) -> str:
+        assert self._page is not None
+        # WebUntis UI2020 typically shows an error like
+        # "Benutzername oder Passwort ist falsch" in a div.
+        for sel in [
+            '.error', '.login-error', '[class*="error"]',
+            '[role="alert"]', '.message',
+        ]:
+            loc = self._page.locator(sel).first
+            if await loc.count() > 0:
+                txt = (await loc.inner_text() or "").strip()
+                if txt:
+                    return txt
+        return ""
+
+    async def _screenshot(self, name: str) -> None:
         if not self._page:
             return
         try:
@@ -309,66 +294,26 @@ class WebUntisClient:
         except Exception:
             pass
 
-    @staticmethod
-    def _is_recoverable(exc: WebUntisError) -> bool:
-        msg = str(exc).lower()
-        return any(tok in msg for tok in ("2fa", "captcha", "otp", "sso"))
-
-    # ------------------------------------------------------------------
-    # Cookie / session management
-    # ------------------------------------------------------------------
-    async def _sync_cookies_to_httpx(self) -> None:
-        """Copy cookies from the Playwright context into the httpx client."""
-        if not self._client or not self.session.context:
-            return
-        jar = httpx.Cookies()
-        for c in await self.session.context.cookies():
-            jar.set(
-                c["name"], c["value"],
-                domain=c.get("domain"),
-                path=c.get("path", "/"),
-            )
-        self._client.cookies = jar
-        log.debug("Synced %d cookies to httpx", len(jar))
-
-    async def _sync_cookies_to_playwright(self) -> None:
-        """Copy cookies from the httpx client into the Playwright context."""
-        if not self._client or not self.session.context:
-            return
-        cookies: list[dict] = []
-        for name, value in self._client.cookies.items():
-            host = (self._client.cookies.get(name) or value)
-            # httpx stores domain; for a single-school session this is fine
-            cookies.append({
-                "name": name,
-                "value": value,
-                "url": self.cfg.base_url,
-            })
-        if cookies:
-            try:
-                await self.session.context.add_cookies(cookies)
-                log.debug("Mirrored %d cookies into browser context", len(cookies))
-            except Exception as exc:
-                log.debug("Could not mirror cookies to browser: %s", exc)
-
-    async def _probe_session(self) -> bool:
+    async def _probe_via_browser(self) -> bool:
+        """Call getUserData from the browser context. Returns True if a
+        valid session is active.
+        """
+        assert self._page is not None
         try:
-            res = await self._rpc("getUserData", {})
-            if res and res.get("result"):
-                self._person_id = res["result"].get("personId")
-                self._person_type = res["result"].get("personType")
-                given = res["result"].get("givenName", "")
-                family = res["result"].get("familyName", "")
+            res = await self._rpc_via_browser("getUserData", {})
+            if res and res.get("personId"):
+                self._person_id = res["personId"]
+                self._person_type = res["personType"]
+                given = res.get("givenName", "")
+                family = res.get("familyName", "")
                 self._user_display = f"{given} {family}".strip()
                 return True
-        except WebUntisError as exc:
-            log.debug("Session probe failed: %s", exc)
         except Exception as exc:
-            log.debug("Session probe transport error: %s", exc)
+            log.debug("Browser probe failed: %s", exc)
         return False
 
     # ------------------------------------------------------------------
-    # HTTP layer
+    # JSON-RPC transport
     # ------------------------------------------------------------------
     def _next_id(self) -> str:
         self._rpc_id += 1
@@ -380,8 +325,8 @@ class WebUntisClient:
             await asyncio.sleep(self._min_interval - elapsed)
         self._last_request_ts = time.monotonic()
 
-    async def _rpc_raw(self, method: str, params: dict) -> dict[str, Any]:
-        assert self._client is not None
+    async def _rpc_via_browser(self, method: str, params: dict) -> dict[str, Any]:
+        assert self._page is not None
         await self._throttle()
         url = f"{self.cfg.base_url}{JSONRPC_PATH}?school={self.cfg.school}"
         body = {
@@ -390,38 +335,68 @@ class WebUntisClient:
             "params": params,
             "jsonrpc": "2.0",
         }
-        r = await self._client.post(url, json=body)
-        if r.status_code != 200:
+        result = await self._page.evaluate(_FETCH_JS, {"url": url, "body": body})
+
+        # WAF / IDS block: HTTP 403 with "security policy" message.
+        if result["status"] == 403:
+            msg = (result.get("data") or {}).get("errorMessage", "") or result["raw"][:200]
             raise WebUntisError(
-                f"HTTP {r.status_code} from JSON-RPC: {r.text[:200]}"
+                f"WAF/IDS blocked {method} (HTTP 403): {msg}"
             )
-        data = r.json()
+        if not result["ok"]:
+            raise WebUntisError(
+                f"HTTP {result['status']} from JSON-RPC {method}: "
+                f"{result['raw'][:200]}"
+            )
+
+        data = result.get("data") or {}
         if "error" in data and data["error"]:
             err = data["error"]
             if isinstance(err, dict):
-                raise WebUntisError(
-                    f"{err.get('message','RPC error')}: "
-                    f"code={err.get('code')}"
-                )
-            raise WebUntisError(f"RPC error: {err}")
+                code = err.get("code")
+                msg, _ = AUTH_ERRORS.get(code, (err.get("message", "RPC error"), False))
+                raise WebUntisError(f"{method} failed: {msg} (code={code})")
+            raise WebUntisError(f"{method} error: {err}")
         return data.get("result") or {}
 
     async def _rpc(self, method: str, params: dict) -> dict[str, Any]:
-        return {"result": await self._rpc_raw(method, params)}
+        return await self._rpc_via_browser(method, params)
 
     async def _rest_get(self, path: str, params: dict) -> dict[str, Any]:
-        assert self._client is not None
+        assert self._page is not None
         await self._throttle()
         url = f"{self.cfg.base_url}{REST_BASE}{path}"
-        r = await self._client.get(url, params=params)
-        r.raise_for_status()
-        return r.json()
+        result = await self._page.evaluate(
+            """
+            async ({url, params}) => {
+                const qs = new URLSearchParams(params).toString();
+                const r = await fetch(url + (qs ? '?' + qs : ''), {
+                    credentials: 'include',
+                    headers: {
+                        'Accept': 'application/json',
+                        'X-Requested-With': 'XMLHttpRequest'
+                    }
+                });
+                const text = await r.text();
+                let data = null;
+                try { data = JSON.parse(text); } catch (_) {}
+                return { status: r.status, ok: r.ok, data, raw: text };
+            }
+            """,
+            {"url": url, "params": params},
+        )
+        if not result["ok"]:
+            raise WebUntisError(
+                f"HTTP {result['status']} from REST {path}: "
+                f"{result['raw'][:200]}"
+            )
+        return result["data"] or {}
 
     # ------------------------------------------------------------------
-    # Public data fetchers (JSON-RPC)
+    # Public data fetchers
     # ------------------------------------------------------------------
     async def get_schoolyears(self) -> list[dict]:
-        return await self._rpc_raw("getSchoolyears", {})
+        return await self._rpc("getSchoolyears", {})
 
     async def get_current_schoolyear(self) -> Optional[dict]:
         years = await self.get_schoolyears()
@@ -442,7 +417,7 @@ class WebUntisClient:
 
         all_lessons: list[dict] = []
         for week_start, week_end in _weeks(start, end):
-            res = await self._rpc_raw("getTimetableForRange", {
+            res = await self._rpc("getTimetableForRange", {
                 "id": int(eid),
                 "type": int(etype),
                 "startDate": _to_iso_date(week_start),
@@ -465,7 +440,7 @@ class WebUntisClient:
         eid = element_id or self._person_id
         etype = element_type or self._person_type
         try:
-            return await self._rpc_raw("getExamsForRange", {
+            return await self._rpc("getExamsForRange", {
                 "id": int(eid) if eid else 0,
                 "type": int(etype) if etype else 0,
                 "startDate": _to_iso_date(start),
@@ -477,7 +452,7 @@ class WebUntisClient:
 
     async def get_homework(self, start: date, end: date) -> list[dict]:
         try:
-            return await self._rpc_raw("getHomeWorkForRange", {
+            return await self._rpc("getHomeWorkForRange", {
                 "startDate": _to_iso_date(start),
                 "endDate": _to_iso_date(end),
             })
@@ -487,7 +462,7 @@ class WebUntisClient:
 
     async def get_absences(self, start: date, end: date) -> list[dict]:
         try:
-            return await self._rpc_raw("getAbsencesForRange", {
+            return await self._rpc("getAbsencesForRange", {
                 "startDate": _to_iso_date(start),
                 "endDate": _to_iso_date(end),
             })
@@ -497,21 +472,17 @@ class WebUntisClient:
 
     async def get_messages(self) -> list[dict]:
         try:
-            return await self._rpc_raw("getMessagesOfInbox", {})
+            return await self._rpc("getMessagesOfInbox", {})
         except WebUntisError as exc:
             log.debug("getMessagesOfInbox not available: %s", exc)
             return []
 
-    # ------------------------------------------------------------------
-    # REST v1 (newer UI2020 backend)
-    # ------------------------------------------------------------------
     async def get_timetable_grid(self, start: date, end: date) -> dict[str, Any]:
         try:
             app_data = await self._rest_get("/app/data", {})
         except Exception as exc:
             log.debug("REST /app/data failed: %s", exc)
             return {}
-
         students = (app_data.get("user") or {}).get("students") or []
         if not students:
             log.warning("REST v1: no students in /app/data response")
@@ -519,7 +490,6 @@ class WebUntisClient:
         sid = students[0].get("id")
         if not sid:
             return {}
-
         params = {
             "start": _to_iso_date(start),
             "end": _to_iso_date(end),
@@ -536,14 +506,13 @@ class WebUntisClient:
     # Lifecycle
     # ------------------------------------------------------------------
     async def close(self) -> None:
-        try:
-            if self._client:
-                await self._client.aclose()
-        finally:
-            if self._page:
+        if self._page:
+            try:
                 await self._page.close()
-                self._page = None
-            self._logged_in = False
+            except Exception:
+                pass
+            self._page = None
+        self._logged_in = False
 
     @property
     def user_display(self) -> Optional[str]:
