@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+.pytest_cache/
+
+# Outputs and sessions
+out/
+sessions/
+logs/
+*.log
+login_failed.png
+
+# Config and secrets
+.env
+config.json
+!config.example.json
+
+# Playwright
+.playwright/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
