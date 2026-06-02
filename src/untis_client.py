@@ -48,7 +48,8 @@ class WebUntisError(RuntimeError):
 
 
 # Map of known JSON-RPC authenticate error codes -> human readable.
-# See: https://untis.at/jr-support (and the WebUntis mobile app source)
+# Sources: Untis mobile app reverse-engineering + community research.
+# (The Untis API does not publish an official error code table.)
 AUTH_ERRORS = {
     -1:  "Invalid username or password",
     -2:  "Account is locked / too many attempts",
@@ -64,6 +65,7 @@ AUTH_ERRORS = {
     -100: "Network error",
     -200: "Session expired",
     -1010: "Login not possible (maintenance)",
+    -8504: "Bad credentials (empty password? wrong username format?)",
 }
 
 
@@ -148,9 +150,15 @@ class WebUntisClient:
                     await self._sync_cookies_to_playwright()
                     return
             except WebUntisError as exc:
-                log.info("JSON-RPC login failed (%s); falling back to form", exc)
-                # Only retry via form for recoverable errors (2FA, captcha)
-                if not self._is_recoverable(exc):
+                # Only fall back to form for recoverable errors (2FA, captcha, SSO).
+                # For "bad credentials" the form path will fail the same way.
+                if self._is_recoverable(exc):
+                    log.info(
+                        "JSON-RPC login needs interactive step (%s); "
+                        "falling back to form", exc,
+                    )
+                else:
+                    log.error("JSON-RPC login failed: %s", exc)
                     raise
 
         # 4. Form-based login fallback (handles 2FA, captcha, custom SSO).

@@ -125,27 +125,38 @@ def load_config(
     json_data = _load_json(Path(config_path))
     env_data = dotenv_values(Path(env_path)) if Path(env_path).exists() else {}
 
+    # Map env-style names to the actual ScraperConfig field names so users
+    # can use either UNTIS_PASSWORD (shell style) or password (config.json style).
+    ENV_ALIASES = {
+        "UNTIS_SERVER": "server",
+        "UNTIS_SCHOOL": "school",
+        "UNTIS_USERNAME": "username",
+        "UNTIS_PASSWORD": "password",
+    }
+
     for k, v in {**json_data, **env_data}.items():
         if v is None or v == "":
             continue
+        # Resolve alias
+        field_name = ENV_ALIASES.get(k, k)
         # boolean coercion
-        if k in {
+        if field_name in {
             "headless", "pretty_json", "include_raw",
             "scrape_timetable", "scrape_exams", "scrape_homework",
-            "scrape_absences", "scrape_messages",
+            "scrape_absences", "scrape_messages", "force_form_login",
         }:
-            current = getattr(cfg, k, False)
-            setattr(cfg, k, _coerce_bool(v, current))
+            current = getattr(cfg, field_name, False)
+            setattr(cfg, field_name, _coerce_bool(v, current))
             continue
-        if k in {"days_back", "days_forward", "slow_mo_ms", "timeout_ms"}:
+        if field_name in {"days_back", "days_forward", "slow_mo_ms", "timeout_ms"}:
             try:
-                setattr(cfg, k, int(v))
+                setattr(cfg, field_name, int(v))
                 continue
             except (TypeError, ValueError):
                 log.warning("Config key %s=%r is not an int, ignoring", k, v)
                 continue
-        if hasattr(cfg, k):
-            setattr(cfg, k, v)
+        if hasattr(cfg, field_name):
+            setattr(cfg, field_name, v)
         else:
             log.debug("Unknown config key: %s", k)
 
@@ -157,12 +168,24 @@ def load_config(
             "See config.example.json."
         )
 
+    if cfg.username and not cfg.password:
+        log.warning(
+            "Username is set (%r) but password is empty — "
+            "check UNTIS_PASSWORD in .env",
+            cfg.username,
+        )
+    elif cfg.password and not cfg.username:
+        log.warning("Password is set but username is empty")
+
     for d in (SESSIONS_DIR, OUT_DIR, LOGS_DIR):
         d.mkdir(parents=True, exist_ok=True)
 
+    pw_set = bool(cfg.password)
     log.info(
-        "Config loaded: server=%s school=%s user=%s days_back=%d days_forward=%d",
+        "Config loaded: server=%s school=%s user=%s password=%s "
+        "days_back=%d days_forward=%d",
         cfg.server, cfg.school, cfg.username or "<empty>",
+        "<set>" if pw_set else "<MISSING>",
         cfg.days_back, cfg.days_forward,
     )
     return cfg
